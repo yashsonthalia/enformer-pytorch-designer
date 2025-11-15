@@ -17,6 +17,19 @@ for device in gpu_devices:
 TFR_INPUT = "sequence"
 TFR_OUTPUT = "target"
 
+INT_TO_BASE = {
+    0: "A",
+    1: "C",
+    2: "G",
+    3: "T",
+    4: "N",  # optional, if you have Ns
+}
+
+
+def ints_to_dna(int_list):
+    """Convert list/array of ints to DNA string."""
+    return "".join(INT_TO_BASE[i] for i in int_list)
+
 
 def file_to_records(filename: str):
     """Read TFRecord file into tf.data.Dataset."""
