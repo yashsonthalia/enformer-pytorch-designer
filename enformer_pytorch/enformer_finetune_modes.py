@@ -114,7 +114,7 @@ def get_enformer_embeddings(
 # extra head projection, akin to how human and mouse tracks were trained
 
 
-class HeadAdapterWrapper(nn.Module):
+class EnformerHeadAdapterWrapper(nn.Module):
     def __init__(
         self,
         *,
@@ -169,7 +169,7 @@ class HeadAdapterWrapper(nn.Module):
         seq,
         *,
         target=None,
-        freeze_enformer=False,
+        freeze_enformer=True,
         finetune_enformer_ln_only=False,
         finetune_last_n_layers_only=None,
     ):

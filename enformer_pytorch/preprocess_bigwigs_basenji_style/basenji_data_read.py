@@ -29,7 +29,7 @@ except:
     pass
 import scipy.interpolate
 
-from basenji_data import ModelSeq
+from basenji_data_original import ModelSeq
 
 """
 basenji_data_read.py

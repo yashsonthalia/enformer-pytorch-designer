@@ -3,7 +3,7 @@ import torch
 
 
 class RandomShift:
-    def __init__(self, max_shift=3, pad_value=0.0):
+    def __init__(self, max_shift=3, pad_value=-1):
         # shifts = [-max_shift, …, 0, …, +max_shift]
         self.shifts = list(range(-max_shift, max_shift + 1))
         self.pad_value = pad_value
@@ -12,9 +12,8 @@ class RandomShift:
         shift = random.choice(self.shifts)
         if shift == 0:
             return seq
-        L, C = seq.shape
         # pad with pad_value using zeros_like
-        pad = torch.zeros_like(seq[: abs(shift), :]) * self.pad_value
+        pad = torch.ones_like(seq[: abs(shift), :]) * self.pad_value
         if shift > 0:
             # shift right
             sliced = seq[:-shift, :]
@@ -31,9 +30,8 @@ class RandomReverseComplement:
 
     def __call__(self, seq: torch.Tensor, tgt: torch.Tensor):
         if random.random() < self.prob:
-            # [A,C,G,T] → [T,G,C,A], then reverse along length
-            seq_rc = seq[..., [3, 2, 1, 0]].flip(0)
-            # target is only reversing, not complement here
+            rev_ids = seq.flip(dims=[1])
+            rc_ids = 3 - rev_ids
             tgt_r = tgt.flip(0)
-            return seq_rc, tgt_r
+            return rc_ids, tgt_r
         return seq, tgt

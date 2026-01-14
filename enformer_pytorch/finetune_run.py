@@ -24,7 +24,7 @@ from tqdm import tqdm
 
 from data_loader import get_dataloader
 from modeling_enformer import from_pretrained, poisson_loss, pearson_corr_coef
-from finetune_modes import HeadAdapterWrapper
+from enformer_finetune_modes import EnformerHeadAdapterWrapper
 from data import seq_indices_to_one_hot
 
 import sys
@@ -82,6 +82,12 @@ def parse_args():
         help="Use DataParallel if multiple GPUs are available",
     )
     parser.add_argument(
+        "--num_tracks",
+        type=int,
+        default=6,
+        help="Number of tracks to use for training",
+    )
+    parser.add_argument(
         "--shuffle_mode",
         choices=["intra_file", "buffer"],
         default=None,
@@ -133,6 +139,11 @@ def parse_args():
         "--add_shift",
         action="store_true",
         help="Stochastic shift augmentation up to ±3 bp",
+    )
+    parser.add_argument(
+        "--frozen_enformer",
+        action="store_true",
+        help="Freeze the enformer backbone",
     )
     parser.add_argument(
         "--add_rc", action="store_true", help="Random reverse-complement augmentation"
@@ -193,6 +204,8 @@ def run_validation(
     local_corr_sum = torch.zeros((), device=device)
     local_count = 0
 
+    tgts = []
+    outs = []
     with torch.no_grad():
         for seq, tgt in tqdm(valid_loader, desc="Validation", leave=False):
             seq = seq_indices_to_one_hot(seq.long()).squeeze(-2)
@@ -202,20 +215,29 @@ def run_validation(
             )
             out = model(seq)
 
+            tgts.append(tgt.reshape(1, -1, tgt.size(-1)))
+            outs.append(out.reshape(1, -1, out.size(-1)))
+
             local_loss_sum += poisson_loss(out, tgt)
             local_corr_sum += pearson_corr_coef(out, tgt).mean()
             local_count += 1
 
-    total_loss = local_loss_sum.item()
+    concat_tgts = torch.cat(tgts, dim=1)  # shape: [1, 896 * n, 6]
+    concat_outs = torch.cat(outs, dim=1)  # shape: [1, 896 * n, 6]
+    total_corr_flat = pearson_corr_coef(concat_outs, concat_tgts).item()
     total_corr = local_corr_sum.item()
+
+    total_loss = local_loss_sum.item()
     stats = torch.tensor(
-        [total_loss, total_corr, local_count], device=device, dtype=torch.float64
+        [total_loss, total_corr, total_corr_flat, local_count],
+        device=device,
+        dtype=torch.float64,
     )
 
     if dist.is_initialized() and dist.get_world_size() > 1:
         dist.all_reduce(stats, op=dist.ReduceOp.SUM)
 
-    total_loss_sum, total_corr_sum, total_count = stats.tolist()
+    total_loss_sum, total_corr_sum, total_corr_flat, total_count = stats.tolist()
     avg_loss = total_loss_sum / total_count
     avg_corr = total_corr_sum / total_count
 
@@ -225,13 +247,13 @@ def run_validation(
     if is_master:
         # Structured, parsable validation log
         print(
-            f"LOG VAL step={step} loss={avg_loss:.6f} corr={avg_corr:.6f}",
+            f"LOG VAL step={step} loss={avg_loss:.6f} corr={total_corr_flat:.6f}",
             flush=True,
         )
 
-        if avg_corr > best_val_corr:
+        if total_corr_flat > best_val_corr:
             save_best_checkpoint(model, ckpt_dir, step, args)
-            new_best = avg_corr
+            new_best = total_corr_flat
 
     if dist.is_initialized() and dist.get_world_size() > 1:
         best_tensor = torch.tensor(new_best, device=device)
@@ -241,7 +263,7 @@ def run_validation(
         best_val_corr = new_best
 
     model.train()
-    return avg_corr, best_val_corr
+    return avg_corr, total_corr_flat, best_val_corr
 
 
 def main_worker(rank: int, world_size: int, args):
@@ -265,9 +287,9 @@ def main_worker(rank: int, world_size: int, args):
         # Build model
         enformer = from_pretrained("EleutherAI/enformer-official-rough")
 
-        model = HeadAdapterWrapper(
+        model = EnformerHeadAdapterWrapper(
             enformer=enformer,
-            num_tracks=6,
+            num_tracks=args.num_tracks,
             post_transformer_embed=False,  # by default, embeddings are taken from after the final pointwise block w/ conv -> gelu - but if you'd like the embeddings right after the transformer block with a learned layernorm, set this to True
         ).cuda()
 
@@ -329,7 +351,7 @@ def main_worker(rank: int, world_size: int, args):
                 if hasattr(model, "module"):  # DDP model
                     model.module.load_state_dict(state)
                 else:
-                    model.load_state_dict(state)
+                    model.load_state_dict(state, strict=True)
 
             # count how many update-steps per epoch (1 update = 1 batch now)
             seq_paths = sorted(Path(args.sequences_dir).glob("train_seq*.npy"))
@@ -370,7 +392,7 @@ def main_worker(rank: int, world_size: int, args):
             split="val",
             batch_size=args.batch_size,
             num_workers=args.num_workers,
-            shuffle_files=False,
+            shuffle_files=True,
             add_shift=False,
             add_rc=False,
             shuffle_mode=None,
@@ -381,7 +403,7 @@ def main_worker(rank: int, world_size: int, args):
         )
 
         best_val_corr = -float("inf")
-        avg_corr, best_val_corr = run_validation(
+        avg_corr, total_corr_flat, best_val_corr = run_validation(
             model,
             valid_loader,
             device,
@@ -424,23 +446,23 @@ def main_worker(rank: int, world_size: int, args):
                 seq = seq_indices_to_one_hot(seq.long()).squeeze(-2)
                 seq, tgt = seq.to(device), tgt.to(device)
 
-                out = model(seq)
+                out = model(seq, freeze_enformer=args.frozen_enformer)
 
                 raw_loss = poisson_loss(out, tgt)
                 loss = raw_loss
 
                 loss.backward()
 
-                # grad clipping
-                pre_clip_norm = nn.utils.clip_grad_norm_(
-                    model.parameters(), max_norm=1.0
-                )
+                # # grad clipping
+                # pre_clip_norm = nn.utils.clip_grad_norm_(
+                #     model.parameters(), max_norm=1.0
+                # )
 
-                total_norm = 0.0
-                for p in model.parameters():
-                    if p.grad is not None:
-                        total_norm += p.grad.data.norm(2).item() ** 2
-                post_clip_norm = total_norm**0.5
+                # total_norm = 0.0
+                # for p in model.parameters():
+                #     if p.grad is not None:
+                #         total_norm += p.grad.data.norm(2).item() ** 2
+                # post_clip_norm = total_norm**0.5
 
                 optimizer.step()
                 optimizer.zero_grad()
@@ -461,7 +483,7 @@ def main_worker(rank: int, world_size: int, args):
                     running_steps = 0
 
                 if args.val_interval > 0 and global_step % args.val_interval == 0:
-                    avg_corr, best_val_corr = run_validation(
+                    avg_corr, total_corr_flat, best_val_corr = run_validation(
                         model,
                         valid_loader,
                         device,
@@ -483,7 +505,7 @@ def main_worker(rank: int, world_size: int, args):
 
             # end-of-epoch validation if not just run
             if args.val_interval <= 0 or global_step % args.val_interval != 0:
-                avg_corr, best_val_corr = run_validation(
+                avg_corr, total_corr_flat, best_val_corr = run_validation(
                     model,
                     valid_loader,
                     device,
